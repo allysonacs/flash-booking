@@ -1,0 +1,34 @@
+# Perfil de desenvolvimento local: aponta para o PostgreSQL do docker-compose.yml.
+# Os valores abaixo são padrões de desenvolvimento e podem ser sobrescritos por variáveis
+# de ambiente — em qualquer ambiente real, credencial vem do ambiente, nunca do arquivo.
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${POSTGRES_DB:flashbooking}
+    username: ${POSTGRES_USER:flashbooking}
+    password: ${POSTGRES_PASSWORD:flashbooking}
+    hikari:
+      pool-name: flash-booking-pool
+      # O pool é o limite real de concorrência da aplicação contra o banco: mantê-lo
+      # pequeno e explícito protege o PostgreSQL de saturação durante a flash sale.
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:20}
+      minimum-idle: ${DB_POOL_MIN_IDLE:5}
+      # Falhar rápido é melhor do que enfileirar requisições que já perderam a corrida.
+      connection-timeout: 3000
+      validation-timeout: 1000
+
+  jpa:
+    properties:
+      hibernate:
+        format_sql: true
+
+# Em desenvolvimento não há serviço de notificação rodando. Desligado por padrão, a
+# aplicação apenas registra o que teria enviado — em vez de encher o log de timeouts e
+# abrir o circuito contra um endereço que não existe. Ligue com NOTIFICATION_ENABLED=true
+# apontando NOTIFICATION_BASE_URL para um serviço real ou para um mock.
+flash-booking:
+  notification:
+    enabled: ${NOTIFICATION_ENABLED:false}
+
+logging:
+  level:
+    org.hibernate.SQL: ${HIBERNATE_SQL_LOG_LEVEL:INFO}

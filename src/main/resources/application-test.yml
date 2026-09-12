@@ -1,0 +1,57 @@
+# Perfil de teste de integração.
+#
+# Não há datasource declarado de propósito: o PostgreSQL é fornecido em runtime por um
+# container Testcontainers via @ServiceConnection. Assim o teste roda contra o mesmo banco
+# de produção — nunca contra um substituto em memória, que aceitaria SQL e semântica de
+# concorrência que o PostgreSQL recusaria.
+# A varredura de expiração fica desligada por padrão nos testes: um job rodando ao fundo
+# tornaria não determinístico qualquer teste que crie reservas. Os testes que exercitam a
+# expiração chamam o serviço diretamente, e o teste do agendamento a religa explicitamente.
+flash-booking:
+  reservation:
+    expiration:
+      enabled: false
+
+  # Nenhum teste fala com um serviço externo real. Quem exercita a resiliência sobe um
+  # servidor HTTP de mentira no próprio teste, religa a notificação e aponta a URL para ele.
+  notification:
+    enabled: false
+    base-url: http://localhost:1
+
+  # Nem relay, nem criação de tópico, nem consumidor por padrão: só as classes de teste que
+  # sobem um Kafka de verdade (Testcontainers) religam isso. Assim nenhum outro contexto de
+  # teste tenta falar com um broker que não existe.
+  events:
+    relay:
+      enabled: false
+    topic:
+      auto-create: false
+    retention:
+      enabled: false
+
+  # O gauge do outbox roda em intervalo próprio; nos testes ele só adicionaria consultas
+  # concorrentes ao TRUNCATE de cada caso.
+  observability:
+    outbox-gauge:
+      enabled: false
+
+spring:
+  kafka:
+    listener:
+      auto-startup: false
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    clean-disabled: true
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+
+logging:
+  level:
+    org.hibernate.SQL: ${HIBERNATE_SQL_LOG_LEVEL:INFO}
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN

@@ -1,0 +1,134 @@
+@startuml fluxo-ponta-a-ponta
+' Fluxo ponta a ponta do Flash Booking, em linguagem para quem não é da área.
+' Entre parênteses: onde cada personagem e cada passo estão no código.
+' Gerar a imagem: java -jar plantuml.jar -charset UTF-8 docs/diagramas/fluxo-ponta-a-ponta.puml
+
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam shadowing false
+skinparam roundCorner 12
+skinparam sequenceMessageAlign center
+skinparam sequenceGroupBodyBackgroundColor #FFFFFF
+skinparam noteBackgroundColor #FFF8DC
+skinparam noteBorderColor #C9A227
+skinparam participantPadding 10
+skinparam boxPadding 8
+
+title Flash Booking — do clique ao aviso, passo a passo\n<size:12><i>(entre parênteses: onde está no código)</i></size>
+
+actor "Comprador\n(site ou app)" as Cliente #D6EAF8
+participant "**Sistema de reservas**\n\nRecepcionista\n(ReservationController)\nGerente\n(ReservationService)\nCaixa\n(ReservationTxService)" as API #D5F5E3
+database "**Banco de dados**\n\nreservas\n(reservations)\nquadro de vendidos\n(event_inventory)\ncaixa de saída\n(outbox_messages)\ncaderno de já tratei\n(processed_events)" as Banco #FCF3CF
+participant "**Carteiro**\nroda a cada 1s\n\n(OutboxRelayJob)\n(OutboxRelayService)\n(KafkaEventPublisher)" as Carteiro #E8DAEF
+queue "**Mural de recados**\nKafka\n\n(tópico\nflash-booking.\nreservations.created)" as Kafka #FADBD8
+participant "**Leitor**\n\n(ReservationCreatedConsumer)\n(ReservationEventProcessor)" as Leitor #E8DAEF
+participant "**Mensageiro**\n\n(NotificationGateway)" as Mensageiro #E8DAEF
+participant "**Serviço de avisos**\nexterno\n\n(POST /notifications/\nreservations)" as Avisos #EAEDED
+participant "**Faxineiro**\nroda a cada 30s\n\n(ReservationExpirationJob)\n(ReservationExpirationService)" as Faxineiro #E8DAEF
+
+== 1. Reservar ingressos ==
+
+Cliente -> API : "Quero 2 ingressos" + número de pedido\n<size:11>(POST /events/{id}/reservations, header Idempotency-Key)</size>\n<size:11>(ReservationController.create → ReservationService.create)</size>
+API -> Banco : Já existe reserva com esse número de pedido?\n<size:11>(ReservationRepository.findByEventIdAndIdempotencyKey)</size>
+
+alt Já existe (o comprador clicou de novo ou a internet caiu)
+  Banco --> API : Sim, é esta
+  API --> Cliente : Devolve a **mesma** reserva — nada é criado de novo\n<size:11>(200 OK)</size>
+else É um pedido novo
+  group Tudo junto: ou acontece tudo, ou nada acontece  (ReservationTxService.createReservation, @Transactional)
+    API -> Banco : Anota a reserva como **PENDENTE** (vale 15 min)\n<size:11>(ReservationRepository.saveAndFlush → tabela reservations)</size>
+    API -> Banco : Escreve um bilhete na **caixa de saída**: "reserva criada"\n<size:11>(OutboxRecorder.recordReservationCreated → tabela outbox_messages)</size>
+    API -> Banco : "Some 2 aos vendidos, **só se couber**"\n<size:11>(SeatAllocator.tryAllocate → EventInventoryRepository.reserveSeats)</size>
+    note right of Banco
+      O banco atende **um de cada vez**
+      nessa conta. Quem chega depois
+      já vê o número atualizado.
+      Assim nunca se vende a mais.
+    end note
+  end
+
+  alt Coube
+    Banco --> API : Pronto, somado (1 linha alterada)
+    API --> Cliente : **Reserva feita!** Confirme em até 15 minutos\n<size:11>(201 Created)</size>
+  else Não coube
+    Banco --> API : Não somou nada (0 linhas alteradas)
+    API -> Banco : Desfaz a reserva e o bilhete\n<size:11>(InsufficientCapacityException → rollback)</size>
+    API --> Cliente : **Esgotado**\n<size:11>(409 Conflict)</size>
+  end
+end
+
+== 2. Levar o recado ao Kafka (em segundo plano, a cada 1s) ==
+
+Carteiro -> Banco : Tem bilhete pendente na caixa de saída?\n<size:11>(OutboxRelayJob.drainOutbox → OutboxRelayService.publishPendingBatch)</size>\n<size:11>(OutboxMessageRepository.claimPending)</size>
+Banco --> Carteiro : Tem este
+Carteiro -> Kafka : Entrega o recado e espera o "recebi"\n<size:11>(KafkaEventPublisher.publish)</size>
+Kafka --> Carteiro : Recebi
+Carteiro -> Banco : Marca o bilhete como **enviado**\n<size:11>(OutboxMessageRepository.markPublished)</size>
+note right of Carteiro
+  Se o Kafka não responder, o bilhete
+  continua pendente e o carteiro tenta
+  de novo na próxima passada.
+  O recado não se perde.
+end note
+
+== 3. Notificar o comprador (segundos depois da reserva) ==
+
+Kafka -> Leitor : Recado: "reserva criada"\n<size:11>(ReservationCreatedConsumer.onReservationCreated)</size>
+Leitor -> Banco : Já tratei este recado antes?\n<size:11>(ReservationEventProcessor.process → ProcessedEventRepository.markProcessed)</size>
+
+alt Primeira vez
+  Leitor -> Mensageiro : Manda enviar o aviso\n<size:11>(NotificationGateway.send)</size>
+  Mensageiro -> Avisos : 📨 **NOTIFICAÇÃO**: dados da reserva\n<size:11>(HTTP POST, header Idempotency-Key = id da reserva)</size>
+  alt Serviço respondeu ok
+    Avisos --> Mensageiro : OK
+  else Serviço falhou
+    Mensageiro -> Avisos : Tenta de novo, até 3 vezes\n<size:11>(@Retry)</size>
+    note right of Mensageiro
+      Se o serviço estiver falhando muito,
+      o mensageiro para de chamar por 30s
+      <size:11>(@CircuitBreaker)</size>
+    end note
+    Mensageiro -> Mensageiro : Desiste e só registra no log\n<size:11>(NotificationGateway.dropNotification)</size>
+  end
+else Recado repetido
+  Leitor -> Leitor : Ignora — o aviso não sai duas vezes
+end
+
+== 4. Como a reserva termina (um destes três caminhos) ==
+
+alt O comprador confirma dentro dos 15 minutos
+  Cliente -> API : "Confirmo minha reserva"\n<size:11>(POST /reservations/{id}/confirmation)</size>\n<size:11>(ReservationController.confirm → ReservationService.confirm)</size>
+  API -> Banco : Muda para **CONFIRMADA** — só se ainda estiver pendente e no prazo\n<size:11>(ReservationRepository.confirmIfPending)</size>
+  API --> Cliente : **Compra concluída**
+  note right of Banco : Os ingressos continuam vendidos.
+
+else O comprador desiste
+  Cliente -> API : "Cancela minha reserva"\n<size:11>(DELETE /reservations/{id})</size>\n<size:11>(ReservationController.cancel → ReservationService.cancel)</size>
+  API -> Banco : Muda para **CANCELADA** — só se ainda estiver pendente\n<size:11>(ReservationRepository.cancelIfPending)</size>
+  API -> Banco : Devolve os ingressos ao estoque\n<size:11>(SeatAllocator.release)</size>
+  API --> Cliente : **Cancelada**
+
+else O comprador some e os 15 minutos passam
+  Faxineiro -> Banco : Quais reservas pendentes já venceram?\n<size:11>(ReservationExpirationJob.expireDueReservations → ReservationExpirationService)</size>\n<size:11>(ReservationRepository.claimExpiredReservations)</size>
+  Banco --> Faxineiro : Estas
+  Faxineiro -> Banco : Muda para **EXPIRADA**\n<size:11>(ReservationRepository.markExpired)</size>
+  Faxineiro -> Banco : Devolve os ingressos ao estoque\n<size:11>(SeatAllocator.release)</size>
+  note right of Faxineiro
+    Vários faxineiros trabalham ao mesmo
+    tempo, mas cada um pega reservas
+    diferentes. Nenhuma é devolvida duas vezes.
+    <size:11>(FOR UPDATE SKIP LOCKED)</size>
+  end note
+end
+
+legend bottom
+  **Resumo**
+  • Ninguém compra ingresso que não existe: o banco só soma se couber.
+  • Clicar duas vezes não cria duas reservas: o número de pedido identifica a tentativa.
+  • O recado "reserva criada" não se perde: fica na caixa de saída até o Kafka confirmar.
+  • O aviso ao comprador tem até 3 tentativas; se o serviço de avisos seguir fora, ele é descartado — a reserva não é afetada.
+  • Nenhum ingresso fica preso: reserva não confirmada volta ao estoque sozinha.
+  • Rodando local, a notificação vem desligada e só aparece no log (application-local.yml).
+endlegend
+
+@enduml

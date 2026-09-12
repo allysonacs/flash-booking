@@ -1,0 +1,123 @@
+name: flash-booking
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: flash-booking-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flashbooking}
+      POSTGRES_USER: ${POSTGRES_USER:-flashbooking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flashbooking}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flashbooking} -d ${POSTGRES_DB:-flashbooking}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+
+  kafka:
+    # Imagem oficial do Apache Kafka em modo KRaft: sem ZooKeeper, um container só.
+    image: apache/kafka:3.9.1
+    container_name: flash-booking-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Dois listeners de propósito: os containers da rede interna falam por kafka:29092;
+      # a aplicação rodando na máquina do desenvolvedor fala por localhost:9092. Um
+      # listener só serviria a um dos dois — e é aí que nasce a confusão clássica de
+      # "conecta mas não produz".
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: flash-booking-cluster-01
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Listar tópicos só funciona quando o broker está realmente pronto para servir.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  kafka-ui:
+    # Interface para inspecionar tópicos, mensagens e grupos durante o desenvolvimento —
+    # é como se confere, de fora da aplicação, que o outbox realmente publicou.
+    image: kafbat/kafka-ui:v1.2.0
+    container_name: flash-booking-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: flash-booking
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "${KAFKA_UI_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  app:
+    # Opcional: `docker compose up` sobe apenas o banco. Para subir a aplicação junto,
+    # use `docker compose --profile app up --build`.
+    profiles: ["app"]
+    build:
+      context: .
+    container_name: flash-booking-app
+    depends_on:
+      postgres:
+        # A aplicação só inicia depois que o healthcheck do banco passa.
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      DB_HOST: postgres
+      DB_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-flashbooking}
+      POSTGRES_USER: ${POSTGRES_USER:-flashbooking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flashbooking}
+      # Dentro da rede do Compose, o broker é alcançado pelo listener interno.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      NOTIFICATION_ENABLED: ${NOTIFICATION_ENABLED:-false}
+      # Em container, log é dado para máquina ler: uma linha JSON por evento, com o id de
+      # correlação como campo — não como texto no meio da mensagem.
+      LOG_STRUCTURED_FORMAT: ${LOG_STRUCTURED_FORMAT:-ecs}
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    healthcheck:
+      # O grupo readiness é o que responde "posso receber tráfego": inclui o banco e,
+      # deliberadamente, NÃO inclui o Kafka.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  kafka-data:

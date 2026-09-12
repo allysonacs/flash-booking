@@ -1,0 +1,243 @@
+spring:
+  application:
+    name: flash-booking
+
+  # Perfil usado quando nenhum outro é informado; testes ativam "test".
+  profiles:
+    default: local
+
+  jpa:
+    # O schema é responsabilidade do Flyway. "validate" faz o Hibernate conferir, na
+    # subida, que o mapeamento corresponde ao schema migrado — e falhar cedo se divergir.
+    hibernate:
+      ddl-auto: validate
+    # Sessão aberta na view esconde N+1 e estende a transação até a serialização da
+    # resposta; desligada desde o início.
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # acks=all: a gravação só é confirmada quando as réplicas in-sync a têm. Com acks=1,
+      # a perda de um broker logo após o ack perde a mensagem — e o outbox já a teria
+      # marcado como publicada.
+      acks: all
+      retries: 5
+      properties:
+        # Produtor idempotente: retentativa do próprio cliente não duplica a mensagem no
+        # broker. Não substitui a idempotência do consumidor, que cobre o que acontece
+        # ANTES (o relay republicando) e DEPOIS (rebalance, reentrega).
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # earliest: um consumidor novo lê o histórico do tópico em vez de ignorá-lo. Com
+      # latest, subir um grupo novo perderia silenciosamente tudo o que já estava lá.
+      auto-offset-reset: earliest
+      # Offset não é commitado sozinho: ele é commitado DEPOIS do processamento, pelo
+      # container. Com auto-commit, um commit por tempo marcaria como consumida uma
+      # mensagem que a aplicação ainda não processou — e uma falha a perderia.
+      enable-auto-commit: false
+    listener:
+      ack-mode: record
+
+# Parâmetros de negócio, externalizados como qualquer outra configuração.
+flash-booking:
+  reservation:
+    ttl: ${RESERVATION_TTL:15m}
+    expiration:
+      enabled: ${RESERVATION_EXPIRATION_ENABLED:true}
+      # Intervalo entre varreduras, contado a partir do fim da anterior.
+      interval: ${RESERVATION_EXPIRATION_INTERVAL:PT30S}
+      batch-size: ${RESERVATION_EXPIRATION_BATCH_SIZE:200}
+      max-batches-per-run: ${RESERVATION_EXPIRATION_MAX_BATCHES:10}
+
+  # Serviço externo de notificação — a única dependência que pode degradar sem invalidar a
+  # venda, e por isso a única com timeout, retry e circuit breaker.
+  notification:
+    enabled: ${NOTIFICATION_ENABLED:true}
+    base-url: ${NOTIFICATION_BASE_URL:http://localhost:9090}
+    path: ${NOTIFICATION_PATH:/notifications/reservations}
+    # Tempo para estabelecer a conexão. Curto de propósito: em rede saudável, conectar leva
+    # milissegundos; o que demora está quebrado, e esperar não conserta.
+    connect-timeout: ${NOTIFICATION_CONNECT_TIMEOUT:500ms}
+    # Tempo de espera pela resposta. Dimensionado pelo pior caso aceitável do serviço, não
+    # pela média: acima disso, desistir é melhor do que ocupar a thread.
+    read-timeout: ${NOTIFICATION_READ_TIMEOUT:1s}
+    dispatch:
+      pool-size: ${NOTIFICATION_POOL_SIZE:2}
+      queue-size: ${NOTIFICATION_QUEUE_SIZE:500}
+
+  # Comunicação assíncrona. O tópico, o particionamento e o grupo de consumo são
+  # configuração: o que serve para uma instância em desenvolvimento não serve para dez em
+  # produção.
+  events:
+    topic:
+      name: ${EVENTS_TOPIC:flash-booking.reservations.created}
+      # Partições = teto de paralelismo do consumo. A ordem é garantida DENTRO da partição,
+      # e a chave é o id do evento (show) — reservas do mesmo show ficam ordenadas entre si.
+      partitions: ${EVENTS_TOPIC_PARTITIONS:3}
+      replicas: ${EVENTS_TOPIC_REPLICAS:1}
+      auto-create: ${EVENTS_TOPIC_AUTO_CREATE:true}
+    relay:
+      enabled: ${EVENTS_RELAY_ENABLED:true}
+      # Latência entre o commit da venda e a mensagem no Kafka.
+      interval: ${EVENTS_RELAY_INTERVAL:PT1S}
+      batch-size: ${EVENTS_RELAY_BATCH_SIZE:100}
+      max-batches-per-run: ${EVENTS_RELAY_MAX_BATCHES:10}
+      publish-timeout: ${EVENTS_PUBLISH_TIMEOUT:5s}
+    consumer:
+      group-id: ${EVENTS_CONSUMER_GROUP:flash-booking.notification-dispatcher}
+      retry-attempts: ${EVENTS_CONSUMER_RETRY_ATTEMPTS:3}
+      retry-backoff: ${EVENTS_CONSUMER_RETRY_BACKOFF:500ms}
+    # Fila e marcas de idempotência são dados operacionais: sem limpeza, as duas tabelas
+    # crescem para sempre dentro do banco que decide as vendas.
+    retention:
+      enabled: ${EVENTS_RETENTION_ENABLED:true}
+      interval: ${EVENTS_RETENTION_INTERVAL:PT1H}
+      batch-size: ${EVENTS_RETENTION_BATCH_SIZE:5000}
+      published-for: ${EVENTS_RETENTION_PUBLISHED_FOR:7 days}
+      # Maior que a retenção do tópico: enquanto o Kafka puder reentregar, a marca de
+      # idempotência precisa existir.
+      processed-events-for: ${EVENTS_RETENTION_PROCESSED_FOR:14 days}
+
+  observability:
+    outbox-gauge:
+      enabled: ${OUTBOX_GAUGE_ENABLED:true}
+      interval: ${OUTBOX_GAUGE_INTERVAL:PT10S}
+
+# Resiliência aplicada a UMA instância — "notification" — e a nenhuma outra. Não há
+# circuit breaker no PostgreSQL: sem banco não há venda, e mascarar essa falha trocaria um
+# erro explícito por corrupção silenciosa.
+resilience4j:
+  retry:
+    instances:
+      notification:
+        # 1 chamada + 2 repetições. Mais do que isso não aumenta a chance de sucesso de uma
+        # falha transitória — só multiplica a carga sobre um serviço que já está mal.
+        max-attempts: ${NOTIFICATION_RETRY_MAX_ATTEMPTS:3}
+        wait-duration: ${NOTIFICATION_RETRY_WAIT:200ms}
+        # Backoff exponencial: 200ms, 400ms. Insistir no mesmo ritmo é o que transforma uma
+        # instabilidade em sobrecarga.
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        # Jitter: com N instâncias, o backoff fixo faz todas repetirem no mesmo instante e
+        # baterem juntas no serviço que se recupera.
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
+        # Só a falha transitória é repetida...
+        retry-exceptions:
+          - com.example.flashbooking.notification.NotificationUnavailableException
+        # ...e a recusa permanente nunca: repetir um 4xx só produz o mesmo 4xx.
+        ignore-exceptions:
+          - com.example.flashbooking.notification.NotificationRejectedException
+  circuitbreaker:
+    instances:
+      notification:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: ${NOTIFICATION_CB_WINDOW:20}
+        # Não decide nada antes de ter amostra suficiente: abrir o circuito com duas
+        # chamadas é ruído, não sinal.
+        minimum-number-of-calls: ${NOTIFICATION_CB_MIN_CALLS:10}
+        failure-rate-threshold: ${NOTIFICATION_CB_FAILURE_RATE:50}
+        wait-duration-in-open-state: ${NOTIFICATION_CB_WAIT_OPEN:30s}
+        permitted-number-of-calls-in-half-open-state: ${NOTIFICATION_CB_HALF_OPEN_CALLS:3}
+        # Sem esta opção, o circuito só sairia de OPEN quando alguém chamasse — e com o
+        # despacho assíncrono pode não haver ninguém chamando.
+        automatic-transition-from-open-to-half-open-enabled: true
+        record-exceptions:
+          - com.example.flashbooking.notification.NotificationUnavailableException
+        ignore-exceptions:
+          - com.example.flashbooking.notification.NotificationRejectedException
+
+# Documentação da API: especificação em /v3/api-docs e Swagger UI em /swagger-ui.html.
+# Pode ser desligada por ambiente (SWAGGER_ENABLED=false) sem mexer em código.
+springdoc:
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:true}
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:true}
+    tags-sorter: alpha
+    display-request-duration: true
+  # Só os controllers da aplicação; o Actuator tem documentação própria.
+  packages-to-scan: com.example.flashbooking.controller
+  default-produces-media-type: application/json
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Lista explícita, nunca "*". Fora daqui ficam, de propósito: env e configprops
+        # (vazam configuração e podem revelar segredo), beans e mappings (mapa da
+        # aplicação para quem a estuda), heapdump e threaddump (dump da memória, com
+        # dados de cliente dentro), loggers (permite mudar log em produção sem auditoria)
+        # e shutdown (derruba a instância com um POST).
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        # Separa "estou vivo" de "posso receber tráfego" — ver os grupos abaixo.
+        enabled: true
+      # Sem autenticação configurada, isto significa "não mostrar detalhes": o corpo do
+      # health é público, e listar componentes internos ajuda quem sonda o sistema.
+      show-details: when_authorized
+      group:
+        # LIVENESS: só o estado do processo. O banco NÃO entra aqui de propósito — um
+        # PostgreSQL indisponível marcaria todas as instâncias como mortas e o
+        # orquestrador as reiniciaria em massa, transformando uma indisponibilidade
+        # temporária do banco em um ciclo de restart que atrasa a recuperação.
+        liveness:
+          include: livenessState
+        # READINESS: o que é preciso para atender. Sem banco não há venda, então o
+        # indicador db entra: a instância sai do balanceador em vez de responder 500.
+        # O KAFKA NÃO ENTRA. A venda não depende dele (ver ARCHITECTURE §14), e ligar o
+        # readiness ao broker faria uma falha de integração tirar a aplicação inteira do
+        # ar — exatamente o acoplamento que o outbox existe para evitar.
+        readiness:
+          include: readinessState,db
+  health:
+    db:
+      enabled: true
+  info:
+    env:
+      enabled: true
+  metrics:
+    tags:
+      # Toda métrica sai identificada pela instância que a produziu; com N réplicas, uma
+      # série temporal sem essa dimensão esconde a réplica doente na média das saudáveis.
+      application: ${spring.application.name}
+      instance: ${HOSTNAME:local}
+
+info:
+  app:
+    name: ${spring.application.name}
+    description: Sistema de reserva de ingressos em modelo flash sale
+
+logging:
+  level:
+    com.example.flashbooking: ${APP_LOG_LEVEL:INFO}
+  # Formato legível por humanos em desenvolvimento, com o id de correlação sempre visível.
+  # Em container, LOG_STRUCTURED_FORMAT=ecs troca tudo por JSON de uma linha por evento,
+  # pronto para um coletor — sem dependência extra e sem mudar uma linha de código.
+  pattern:
+    level: "%5p [${spring.application.name},%X{correlationId:-}]"
+  structured:
+    format:
+      console: ${LOG_STRUCTURED_FORMAT:}

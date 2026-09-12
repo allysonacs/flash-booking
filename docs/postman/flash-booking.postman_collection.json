@@ -1,0 +1,902 @@
+{
+  "info": {
+    "name": "Flash Booking — fluxo completo",
+    "description": "Reserva de ingressos em modelo flash sale.\n\nCOMO USAR: rode a pasta '1. Fluxo principal' na ordem (Run folder). Os ids são salvos automaticamente em variáveis da coleção — não é preciso copiar nada à mão.\n\nDepois rode a pasta '2. Cenários do desafio' para os casos de erro, expiração e observabilidade.\n\nVariável baseUrl: http://localhost:8080",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Fluxo principal (rode na ordem)",
+      "item": [
+        {
+          "name": "00 · Health (readiness)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health/readiness",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health",
+                "readiness"
+              ]
+            },
+            "description": "Confirma que a aplicação está pronta para receber tráfego. O grupo readiness inclui o banco e NÃO inclui o Kafka — de propósito."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('está pronta', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "01 · Criar evento (POST /events)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events"
+              ]
+            },
+            "description": "Cria o evento e o inventário na MESMA transação. Guarda o id em {{eventId}}.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Show do Guia\",\n  \"capacity\": 10\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('eventId', body.id);",
+                  "pm.test('disponibilidade = capacidade', () => pm.expect(body.availableCapacity).to.eql(body.totalCapacity));",
+                  "console.log('eventId =', body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "02 · Consultar evento (GET /events/:id)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}"
+              ]
+            },
+            "description": "availableCapacity é DERIVADO (total - reserved), nunca lido de uma coluna: não existe segunda fonte da verdade."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "03 · Reservar (POST /events/:id/reservations)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}",
+                "reservations"
+              ]
+            },
+            "description": "Cria a reserva PENDING, compromete os assentos e grava o evento no outbox — tudo em uma transação. Guarda o id em {{reservationId}}.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 2\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Uma chave nova por execução do fluxo, para o replay do passo 04 fazer sentido.",
+                  "if (!pm.collectionVariables.get('idempotencyKey')) {",
+                  "  pm.collectionVariables.set('idempotencyKey', 'guia-' + Date.now());",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('reservationId', body.id);",
+                  "pm.test('nasce PENDING', () => pm.expect(body.status).to.eql('PENDING'));",
+                  "pm.test('tem prazo de validade', () => pm.expect(body.expiresAt).to.be.a('string'));",
+                  "console.log('reservationId =', body.id, '| expira em', body.expiresAt);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "04 · Repetir com a MESMA chave (replay → 200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}",
+                "reservations"
+              ]
+            },
+            "description": "IDEMPOTÊNCIA: mesma chave + mesmo payload devolve a reserva ORIGINAL com 200 (nada foi criado). Repare que o id é idêntico ao do passo 03.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 2\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK (replay, não 201)', () => pm.response.to.have.status(200));",
+                  "pm.test('devolve a MESMA reserva', () => pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get('reservationId')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "05 · Mesma chave, payload diferente (→ 409)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}",
+                "reservations"
+              ]
+            },
+            "description": "Chave reutilizada com outra intenção NÃO é retentativa. Devolver a reserva antiga esconderia do cliente que o pedido novo não foi atendido.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('code = IDEMPOTENCY_KEY_CONFLICT', () => pm.expect(pm.response.json().code).to.eql('IDEMPOTENCY_KEY_CONFLICT'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "06 · Consultar reserva (GET /reservations/:id)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{reservationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{reservationId}}"
+              ]
+            },
+            "description": "Estado da reserva lido da fonte da verdade — fortemente consistente."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "console.log('status =', pm.response.json().status);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "07 · Disponibilidade após a reserva",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}"
+              ]
+            },
+            "description": "reservedCount subiu e availableCapacity caiu: os assentos estão comprometidos enquanto a reserva vive."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('assentos comprometidos', () => pm.expect(pm.response.json().reservedCount).to.be.above(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "08 · Cancelar (DELETE /reservations/:id)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{reservationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{reservationId}}"
+              ]
+            },
+            "description": "Cancela e devolve os assentos NO MESMO commit que muda o estado da reserva."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "09 · Cancelar de novo (idempotente → 204)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{reservationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{reservationId}}"
+              ]
+            },
+            "description": "O cliente pediu um estado e esse estado já é o atual. O assento NÃO volta duas vezes — a transição é guardada por WHERE status = 'PENDING'."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 de novo', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "10 · Disponibilidade restaurada",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}"
+              ]
+            },
+            "description": "Fecha o ciclo: os assentos cancelados voltaram para a venda, e apenas uma vez."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('inventário voltou ao total', () => pm.expect(body.availableCapacity).to.eql(body.totalCapacity));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "O caminho feliz de ponta a ponta: criar evento → reservar → replay idempotente → consultar → cancelar → conferir que o assento voltou."
+    },
+    {
+      "name": "2. Cenários do desafio",
+      "item": [
+        {
+          "name": "A · Esgotado (→ 409 INSUFFICIENT_CAPACITY)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}",
+                "reservations"
+              ]
+            },
+            "description": "ZERO OVERSELL: pedir mais do que existe é recusado inteiro. Esgotado é resposta de NEGÓCIO (409), não defeito (500).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 999\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('code = INSUFFICIENT_CAPACITY', () => pm.expect(pm.response.json().code).to.eql('INSUFFICIENT_CAPACITY'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "B · Evento inexistente (→ 404)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events/00000000-0000-0000-0000-000000000000/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "00000000-0000-0000-0000-000000000000",
+                "reservations"
+              ]
+            },
+            "description": "ERROS EXPLÍCITOS: RFC 7807 com um code estável para o cliente programar em cima.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));",
+                  "pm.test('code = EVENT_NOT_FOUND', () => pm.expect(pm.response.json().code).to.eql('EVENT_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "C · Reserva inexistente (→ 404)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Mesmo contrato de erro para todos os recursos."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('code = RESERVATION_NOT_FOUND', () => pm.expect(pm.response.json().code).to.eql('RESERVATION_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "D · Payload inválido (→ 400 com errors[])",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events"
+              ]
+            },
+            "description": "Validação de formato acontece ANTES de qualquer regra de negócio, e a resposta diz exatamente qual campo está errado.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"\",\n  \"capacity\": 0\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('lista os campos', () => pm.expect(pm.response.json().errors).to.be.an('array').that.is.not.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "E · Id com formato inválido (→ 400)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/events/isto-nao-e-um-uuid",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "isto-nao-e-um-uuid"
+              ]
+            },
+            "description": "Erro de formato de parâmetro, não 500."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "F · Correlação: envio meu próprio id",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-Id",
+                "value": "apresentacao-123"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            },
+            "description": "OBSERVABILIDADE: o id que eu mando é preservado, devolvido na resposta e aparece em TODOS os logs daquela requisição — inclusive no consumidor Kafka, em outra instância."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('devolve o meu id', () => pm.expect(pm.response.headers.get('X-Correlation-Id')).to.eql('apresentacao-123'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "G · Expiração: criar reserva curta",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "events",
+                "{{eventId}}",
+                "reservations"
+              ]
+            },
+            "description": "Passo 1 de 2. Exige a aplicação rodando com TTL curto: RESERVATION_TTL=20s RESERVATION_EXPIRATION_INTERVAL=PT5S ./gradlew bootRun",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('expiringReservationId', body.id);",
+                  "console.log('expira em', body.expiresAt, '— rode o passo H depois desse horário');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "H · Expiração: conferir status (→ EXPIRED)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{expiringReservationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{expiringReservationId}}"
+              ]
+            },
+            "description": "Passo 2 de 2. Rode DEPOIS do expiresAt do passo G. Ninguém chamou nada: uma varredura agendada mudou PENDING → EXPIRED e devolveu os assentos."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const status = pm.response.json().status;",
+                  "console.log('status =', status);",
+                  "pm.test('expirou sozinha (rode após o expiresAt)', () => pm.expect(status).to.eql('EXPIRED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "I · Cancelar reserva expirada (→ 409)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{expiringReservationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{expiringReservationId}}"
+              ]
+            },
+            "description": "CANCELAR vs EXPIRAR: as duas transições saem de PENDING e são guardadas por ele. Vence quem travar a linha primeiro; aqui a expiração já venceu, então o cancelamento é recusado — e o assento não volta duas vezes."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409', () => pm.response.to.have.status(409));",
+                  "pm.test('code = INVALID_RESERVATION_STATE', () => pm.expect(pm.response.json().code).to.eql('INVALID_RESERVATION_STATE'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "J · Métrica: reservas criadas",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/flashbooking.reservations.created",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "flashbooking.reservations.created"
+              ]
+            },
+            "description": "Métrica de NEGÓCIO. A irmã dela, flashbooking.reservations.rejected, tem tag reason=sold_out — em HTTP, 'esgotou' e 'quebrou' são o mesmo 409."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "K · Métrica: fila do outbox",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/flashbooking.outbox.pending",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "flashbooking.outbox.pending"
+              ]
+            },
+            "description": "Se o Kafka cair, a venda continua e ESTE número cresce. É o único sinal de que a integração parou."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "L · Endpoint perigoso NÃO exposto (→ 404)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/env",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "env"
+              ]
+            },
+            "description": "SEGURANÇA: apenas health, info e metrics são expostos. env, beans, heapdump, threaddump, loggers e shutdown ficam de fora — e há um teste automatizado que falha se alguém expuser."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 — não exposto', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Um request por requisito: oversell, erros explícitos, expiração automática, cancelar vs expirar, observabilidade e superfície do Actuator."
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "eventId",
+      "value": ""
+    },
+    {
+      "key": "reservationId",
+      "value": ""
+    },
+    {
+      "key": "expiringReservationId",
+      "value": ""
+    },
+    {
+      "key": "idempotencyKey",
+      "value": ""
+    }
+  ]
+}
